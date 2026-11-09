@@ -1,0 +1,47 @@
+# Both branch-specific CodeBuild projects execute this file from the checked-out commit.
+version: 0.2
+env:
+  shell: bash
+  variables:
+    # Import the local package directly; builds do not install an editable checkout.
+    PYTHONPATH: src
+    PYTHONDONTWRITEBYTECODE: '1'
+    PIP_DISABLE_PIP_VERSION_CHECK: '1'
+phases:
+  install:
+    # A dependency failure must stop the build before any environment is modified.
+    on-failure: ABORT
+    runtime-versions:
+      python: '3.12'
+    commands:
+      - pip install --no-cache-dir -r requirements-dev.txt
+  pre_build:
+    on-failure: ABORT
+    commands:
+      # Validate deployment contracts without generating, uploading, or processing source data.
+      - python scripts/build.py --check-context
+      - cfn-lint -r us-east-1 -t infra/*.yaml
+      # Reject formatting drift before deploying the branch's source code.
+      - ruff format --check --no-cache src dags scripts tests
+      - ruff check --no-cache src dags scripts tests
+      # Data-processing tests remain available locally; some generate temporary fixtures.
+      # CI runs only deployment tests so data preparation stays outside CodeBuild entirely.
+      - pytest -q tests/test_build.py tests/test_deploy.py tests/test_infrastructure.py
+      - |
+        set -euo pipefail
+        # Use an isolated Airflow installation so its pinned dependencies cannot
+        # replace the SDK and validators used by the deployment process.
+        checks_dir=$(mktemp -d)
+        # Remove the temporary Airflow runtime even after a validation failure.
+        trap 'rm -rf "$checks_dir"' EXIT
+        python -m venv "$checks_dir/airflow"
+        "$checks_dir/airflow/bin/pip" install --no-cache-dir \
+          apache-airflow==2.11.0 boto3 \
+          --constraint https://raw.githubusercontent.com/apache/airflow/constraints-2.11.0/constraints-3.12.txt
+        AIRFLOW_HOME="$checks_dir/airflow-home" \
+          "$checks_dir/airflow/bin/python" scripts/check_dags.py
+  build:
+    on-failure: ABORT
+    commands:
+      # Success means infrastructure and the expected paused DAG revision are available.
+      - python scripts/build.py

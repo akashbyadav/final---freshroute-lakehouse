@@ -1,0 +1,428 @@
+# CloudFormation source: edit this template directly.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FreshRoute Airflow network and operational monitoring
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+Resources:
+  # Dedicated dev/prod networks place MWAA workers in two private subnets.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:
+        Fn::If:
+          - Production
+          - 10.52.0.0/16
+          - 10.51.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: freshroute-${Environment}
+  # Provide the public subnets with an internet route used by their NAT gateways.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+  # Attach the gateway before creating dependent public routes and NAT resources.
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: Vpc
+      InternetGatewayId:
+        Ref: InternetGateway
+  # Place public routing/NAT resources in the first Availability Zone.
+  Public0Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      CidrBlock:
+        Fn::If:
+          - Production
+          - 10.52.0.0/24
+          - 10.51.0.0/24
+  # Use an explicit public route table instead of inheriting the VPC default.
+  Public0Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+  # Attach the public subnet to the route table that reaches the internet gateway.
+  Public0Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: Public0Routes
+      SubnetId:
+        Ref: Public0Subnet
+  # Place MWAA workers in the first private subnet without public IP assignment.
+  Private0Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ''
+      CidrBlock:
+        Fn::If:
+          - Production
+          - 10.52.10.0/24
+          - 10.51.10.0/24
+  # Use a private route table whose default route points to NAT, not the internet gateway.
+  Private0Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+  # Apply the private route table to the corresponding MWAA subnet.
+  Private0Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: Private0Routes
+      SubnetId:
+        Ref: Private0Subnet
+  # Reserve the outbound address for the NAT shared by dev or used by the first prod zone.
+  Eip0:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  # Dev shares one NAT gateway; prod adds a second gateway for the other availability zone.
+  Nat0:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+          - Eip0
+          - AllocationId
+      SubnetId:
+        Ref: Public0Subnet
+    DependsOn: GatewayAttachment
+  # Send internet-bound public-subnet traffic through the attached internet gateway.
+  Public0DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: Public0Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+    DependsOn: GatewayAttachment
+  # Send non-S3 outbound worker traffic through the selected NAT gateway.
+  Private0DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: Private0Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId:
+        Ref: Nat0
+  # Place public routing/NAT resources in the second Availability Zone.
+  Public1Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ''
+      CidrBlock:
+        Fn::If:
+          - Production
+          - 10.52.1.0/24
+          - 10.51.1.0/24
+  # Use an explicit public route table instead of inheriting the VPC default.
+  Public1Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+  # Attach the public subnet to the route table that reaches the internet gateway.
+  Public1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: Public1Routes
+      SubnetId:
+        Ref: Public1Subnet
+  # Place MWAA workers in the second private subnet without public IP assignment.
+  Private1Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: Vpc
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ''
+      CidrBlock:
+        Fn::If:
+          - Production
+          - 10.52.11.0/24
+          - 10.51.11.0/24
+  # Use a private route table whose default route points to NAT, not the internet gateway.
+  Private1Routes:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+  # Apply the private route table to the corresponding MWAA subnet.
+  Private1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: Private1Routes
+      SubnetId:
+        Ref: Private1Subnet
+  # Allocate the second NAT address only for production.
+  Eip1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+    Condition: Production
+  # Production gives the second private subnet its own Availability Zone egress path.
+  Nat1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+          - Eip1
+          - AllocationId
+      SubnetId:
+        Ref: Public1Subnet
+    DependsOn: GatewayAttachment
+    Condition: Production
+  # Send internet-bound public-subnet traffic through the attached internet gateway.
+  Public1DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: Public1Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+    DependsOn: GatewayAttachment
+  # Send non-S3 outbound worker traffic through the selected NAT gateway.
+  Private1DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: Private1Routes
+      DestinationCidrBlock: 0.0.0.0/0
+      # Dev shares Nat0 to reduce infrastructure; prod uses the second-zone Nat1.
+      NatGatewayId:
+        Fn::If:
+          - Production
+          - Ref: Nat1
+          - Ref: Nat0
+  # Route S3 traffic directly through a gateway endpoint.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId:
+        Ref: Vpc
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - Ref: Private0Routes
+        - Ref: Private1Routes
+  # Permit outbound service calls; inbound traffic is granted only by the self-reference below.
+  AirflowSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private MWAA component communication
+      VpcId:
+        Ref: Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+  # Allow MWAA components in this same group to communicate without public worker ingress.
+  AirflowSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Ref: AirflowSecurityGroup
+      SourceSecurityGroupId:
+        Ref: AirflowSecurityGroup
+      IpProtocol: '-1'
+  # Capture DAG discovery and import errors before tasks can be scheduled.
+  DAGProcessingLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: airflow-freshroute-${Environment}-airflow-DAGProcessing
+      RetentionInDays: 30
+  # Capture scheduling decisions and run/task queue behavior.
+  SchedulerLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: airflow-freshroute-${Environment}-airflow-Scheduler
+      RetentionInDays: 30
+  # Capture processing logs, run IDs, quality results, and Athena query IDs.
+  TaskLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: airflow-freshroute-${Environment}-airflow-Task
+      RetentionInDays: 30
+  # Capture authenticated Airflow web/API service diagnostics.
+  WebServerLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: airflow-freshroute-${Environment}-airflow-WebServer
+      RetentionInDays: 30
+  # Capture worker startup and execution service diagnostics.
+  WorkerLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: airflow-freshroute-${Environment}-airflow-Worker
+      RetentionInDays: 30
+  # Managed Airflow schedules and serializes incremental runs and historical rebuilds.
+  Airflow:
+    Type: AWS::MWAA::Environment
+    Properties:
+      Name:
+        Fn::Sub: freshroute-${Environment}-airflow
+      # Keep this version aligned with the isolated DAG-import check in buildspec.yml.
+      AirflowVersion: 2.11.0
+      EnvironmentClass: mw1.small
+      MinWorkers: 1
+      MaxWorkers: 2
+      Schedulers: 2
+      # Storage is deployed first; CodeBuild uploads modules/configuration before creating MWAA.
+      SourceBucketArn:
+        Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}
+      DagS3Path: dags
+      ExecutionRoleArn:
+        Fn::ImportValue:
+          Fn::Sub: freshroute-${Environment}-PipelineRoleArn
+      # The web/API endpoint is public and IAM-authenticated; workers still use private subnets.
+      WebserverAccessMode: PUBLIC_ONLY
+      NetworkConfiguration:
+        SecurityGroupIds:
+          - Ref: AirflowSecurityGroup
+        SubnetIds:
+          - Ref: Private0Subnet
+          - Ref: Private1Subnet
+      # Start paused so the operator can upload all source files before enabling processing.
+      AirflowConfigurationOptions:
+        core.load_examples: 'False'
+        core.dags_are_paused_at_creation: 'True'
+        # Always expose dag_run.conf in the UI so operators can enter backfill dates.
+        webserver.show_trigger_form_if_no_params: 'True'
+      LoggingConfiguration:
+        DagProcessingLogs:
+          Enabled: true
+          LogLevel: INFO
+        SchedulerLogs:
+          Enabled: true
+          LogLevel: INFO
+        TaskLogs:
+          Enabled: true
+          LogLevel: INFO
+        WebserverLogs:
+          Enabled: true
+          LogLevel: INFO
+        WorkerLogs:
+          Enabled: true
+          LogLevel: INFO
+      Tags:
+        Project: freshroute
+        Environment:
+          Ref: Environment
+    # Create outbound paths, internal communication, and log groups before starting MWAA.
+    DependsOn:
+      - Private0DefaultRoute
+      - Private1DefaultRoute
+      - AirflowSelfIngress
+      - S3Endpoint
+      - DAGProcessingLog
+      - SchedulerLog
+      - TaskLog
+      - WebServerLog
+      - WorkerLog
+  # Alarm on processing failures; operational logs carry run IDs and Athena query IDs.
+  PipelineFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: freshroute-${Environment}-PipelineFailure
+      Namespace: FreshRoute
+      MetricName: PipelineFailure
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # An idle stream or an interval without a failure metric is not a breach.
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Environment
+          Value:
+            Ref: Environment
+  # Signal an elevated rejected-record count emitted after successful publication.
+  RejectedRecordsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: freshroute-${Environment}-RejectedRecords
+      Namespace: FreshRoute
+      MetricName: RejectedRecords
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # An idle stream or an interval without a failure metric is not a breach.
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: Environment
+          Value:
+            Ref: Environment
+  # Signal sustained Firehose-to-S3 delivery delay rather than DAG scheduling latency.
+  FreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName:
+        Fn::Sub: freshroute-${Environment}-ingestion-delay
+      Namespace: AWS/Firehose
+      MetricName: DeliveryToS3.DataFreshness
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      # An idle stream or an interval without a failure metric is not a breach.
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value:
+            Fn::Sub: freshroute-${Environment}-events
+Outputs:
+  AirflowUrl:
+    Value:
+      Fn::GetAtt:
+        - Airflow
+        - WebserverUrl
+Conditions:
+  Production:
+    Fn::Equals:
+      - Ref: Environment
+      - prod

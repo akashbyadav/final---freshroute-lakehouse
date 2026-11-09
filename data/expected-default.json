@@ -1,0 +1,26 @@
+{
+  "valid_orders": 7000,
+  "invalid_order_records": 42,
+  "stores": 6,
+  "products": 24,
+  "envelopes": {
+    "base": 72217,
+    "late": 246
+  },
+  "orders_by_business_date": {
+    "2026-10-01": 1000,
+    "2026-10-02": 1000,
+    "2026-10-03": 1000,
+    "2026-10-04": 1000,
+    "2026-10-05": 1000,
+    "2026-10-06": 1000,
+    "2026-10-07": 1000
+  },
+  "after_all_events": {
+    "delivered_orders": 6765,
+    "delivered_order_value_paise": 286349380,
+    "on_time_orders": 3473,
+    "late_orders": 3292,
+    "cancelled_orders": 235
+  }
+}

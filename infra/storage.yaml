@@ -1,0 +1,1334 @@
+# CloudFormation source: edit this template directly.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FreshRoute storage, catalog, governance and ingestion
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+Resources:
+  # Retain source and warehouse data on stack deletion; block public access and enable versioning.
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: freshroute-${Environment}-data-${AWS::AccountId}-${AWS::Region}
+      # Retain earlier object versions for inspection and recovery after replacement.
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # All four controls stay enabled; data access is through authenticated roles.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: freshroute
+        - Key: Environment
+          Value:
+            Ref: Environment
+      # Expire temporary query results, while retaining Bronze inputs and Iceberg warehouse files.
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: query-results
+            Status: Enabled
+            Prefix: query-results/
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+    # Stack deletion preserves persisted data; removal is an explicit separate action.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Require TLS for both bucket-level and object-level requests.
+  DataTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - DataBucket
+                  - Arn
+              - Fn::Sub: ${DataBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  # Version DAG files and commit-addressed code separately from Bronze and warehouse data.
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: freshroute-${Environment}-artifacts-${AWS::AccountId}-${AWS::Region}
+      # Retain earlier object versions for inspection and recovery after replacement.
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # All four controls stay enabled; data access is through authenticated roles.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: freshroute
+        - Key: Environment
+          Value:
+            Ref: Environment
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+    # Stack deletion preserves persisted data; removal is an explicit separate action.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Apply the same TLS-only access rule to deployment artifacts.
+  ArtifactsTlsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: ArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - ArtifactsBucket
+                  - Arn
+              - Fn::Sub: ${ArtifactsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  # The writer can read Bronze but write only processed data, run state, and query results.
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: freshroute-${Environment}-pipeline
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - airflow.amazonaws.com
+                - airflow-env.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPublicAccessBlock
+                Resource:
+                  - Fn::GetAtt:
+                      - DataBucket
+                      - Arn
+                  - Fn::GetAtt:
+                      - ArtifactsBucket
+                      - Arn
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: ${DataBucket.Arn}/*
+                  - Fn::Sub: ${ArtifactsBucket.Arn}/*
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - Fn::Sub: ${DataBucket.Arn}/warehouse/*
+                  - Fn::Sub: ${DataBucket.Arn}/control/*
+                  - Fn::Sub: ${DataBucket.Arn}/quarantine/*
+                  - Fn::Sub: ${DataBucket.Arn}/query-results/*
+              - Effect: Allow
+                # Run and inspect queries through the named workgroup and its enforced results
+                # location.
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource:
+                  Fn::Sub:
+                    arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/freshroute-${Environment}-pipeline
+              - Effect: Allow
+                # Read or maintain catalog metadata only within the listed environment
+                # databases/tables.
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:BatchGetPartition
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/freshroute_${Environment}_*
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/freshroute_${Environment}_*/*
+              - Effect: Allow
+                # Allow data credential vending and unscoped metric/log discovery APIs; table grants
+                # remain separate.
+                Action:
+                  - lakeformation:GetDataAccess
+                  - cloudwatch:PutMetricData
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:PublishMetrics
+                Resource:
+                  Fn::Sub:
+                    arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/freshroute-${Environment}-airflow
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:GetLogRecord
+                  - logs:GetLogGroupFields
+                  - logs:GetQueryResults
+                  - logs:DescribeLogStreams
+                Resource:
+                  Fn::Sub:
+                    arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-freshroute-${Environment}-*:*
+              - Effect: Allow
+                # Allow MWAA Celery workers to exchange task messages through managed queues.
+                Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:sqs:${AWS::Region}:*:airflow-celery-*
+              - Effect: Allow
+                # Allow encryption operations only through the SQS service condition below.
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey*
+                  - kms:Encrypt
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    kms:ViaService:
+                      Fn::Sub: sqs.${AWS::Region}.amazonaws.com
+  # Analysts query Gold using Lake Formation credentials; warehouse S3 access is not granted
+  # directly.
+  AnalystRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: freshroute-${Environment}-analyst
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Console discovery exposes service names, not lake data. Query execution
+                # and Glue table reads remain scoped to the analyst workgroup and Gold.
+                Action:
+                  - athena:ListWorkGroups
+                  - athena:ListDataCatalogs
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - athena:GetDataCatalog
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog
+              - Effect: Allow
+                # Run and inspect queries through the named workgroup and its enforced results
+                # location.
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListQueryExecutions
+                Resource:
+                  Fn::Sub:
+                    arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/freshroute-${Environment}-analyst
+              - Effect: Allow
+                # Read or maintain catalog metadata only within the listed environment
+                # databases/tables.
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/freshroute_${Environment}_gold
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/freshroute_${Environment}_gold/*
+              - Effect: Allow
+                # Allow data credential vending and unscoped metric/log discovery APIs; table grants
+                # remain separate.
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt:
+                    - DataBucket
+                    - Arn
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  Fn::GetAtt:
+                    - DataBucket
+                    - Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - query-results/analyst/*
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  Fn::Sub: ${DataBucket.Arn}/query-results/analyst/*
+  # Lake Formation uses this service role when vending governed table credentials.
+  RegistrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: freshroute-${Environment}-lake-registration
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lakeformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt:
+                    - DataBucket
+                    - Arn
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  Fn::Sub: ${DataBucket.Arn}/warehouse/*
+  # Hybrid mode allows the IAM writer alongside an explicitly governed analyst.
+  SilverRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn:
+        Fn::Sub: ${DataBucket.Arn}/warehouse/silver
+      RoleArn:
+        Fn::GetAtt:
+          - RegistrationRole
+          - Arn
+      UseServiceLinkedRole: false
+      # The writer keeps its scoped IAM path; the analyst is explicitly opted into LF enforcement.
+      HybridAccessEnabled: true
+  # Allow the processing role to reference this registered S3 location in catalog operations.
+  SilverWriterLocation:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier:
+          Fn::GetAtt:
+            - PipelineRole
+            - Arn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+      Resource:
+        DataLocation:
+          CatalogId:
+            Ref: AWS::AccountId
+          ResourceArn:
+            Fn::Sub: ${DataBucket.Arn}/warehouse/silver
+    DependsOn: SilverRegistration
+  # Allow CloudFormation to create the initial table definitions at this registered location.
+  SilverCreatorLocation:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier:
+          Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/freshroute-${Environment}-cfn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+      Resource:
+        DataLocation:
+          CatalogId:
+            Ref: AWS::AccountId
+          ResourceArn:
+            Fn::Sub: ${DataBucket.Arn}/warehouse/silver
+    DependsOn: SilverRegistration
+  # Register only the published warehouse prefix for governed Gold access.
+  GoldRegistration:
+    Type: AWS::LakeFormation::Resource
+    Properties:
+      ResourceArn:
+        Fn::Sub: ${DataBucket.Arn}/warehouse/gold
+      RoleArn:
+        Fn::GetAtt:
+          - RegistrationRole
+          - Arn
+      UseServiceLinkedRole: false
+      # The writer keeps its scoped IAM path; the analyst is explicitly opted into LF enforcement.
+      HybridAccessEnabled: true
+  # Allow the processing role to reference this registered S3 location in catalog operations.
+  GoldWriterLocation:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier:
+          Fn::GetAtt:
+            - PipelineRole
+            - Arn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+      Resource:
+        DataLocation:
+          CatalogId:
+            Ref: AWS::AccountId
+          ResourceArn:
+            Fn::Sub: ${DataBucket.Arn}/warehouse/gold
+    DependsOn: GoldRegistration
+  # Allow CloudFormation to create the initial table definitions at this registered location.
+  GoldCreatorLocation:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier:
+          Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/freshroute-${Environment}-cfn
+      Permissions:
+        - DATA_LOCATION_ACCESS
+      PermissionsWithGrantOption: []
+      Resource:
+        DataLocation:
+          CatalogId:
+            Ref: AWS::AccountId
+          ResourceArn:
+            Fn::Sub: ${DataBucket.Arn}/warehouse/gold
+    DependsOn: GoldRegistration
+  # Database-specific defaults preserve unrelated catalog settings in this AWS account.
+  # Catalog the shared JSON envelope over the immutable Bronze prefix.
+  RawDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Name:
+          Fn::Sub: freshroute_${Environment}_raw
+        Description: FreshRoute raw data
+        # Set defaults for this database only; do not replace unrelated account catalog settings.
+        CreateTableDefaultPermissions:
+          - Principal:
+              DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+            Permissions:
+              - ALL
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Lake Formation's account defaults may already grant ALL when Glue creates this database.
+  # Use the grant-style resource so an existing IAM fallback does not cause AlreadyExists.
+  RawIamAccess:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+      Resource:
+        DatabaseResource:
+          CatalogId:
+            Ref: AWS::AccountId
+          Name:
+            Ref: RawDatabase
+    # This grant may predate the stack; preserve it alongside the retained database.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Hold the current accepted revision of each business record in Iceberg tables.
+  SilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Name:
+          Fn::Sub: freshroute_${Environment}_silver
+        Description: FreshRoute silver data
+        # Set defaults for this database only; do not replace unrelated account catalog settings.
+        CreateTableDefaultPermissions:
+          - Principal:
+              DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+            Permissions:
+              - ALL
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Reapply the database's IAM fallback even when account defaults already created the grant.
+  # Table defaults and analyst opt-in remain separate from this database-level permission.
+  SilverIamAccess:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+      Resource:
+        DatabaseResource:
+          CatalogId:
+            Ref: AWS::AccountId
+          Name:
+            Ref: SilverDatabase
+    # Retaining the database must also preserve its IAM-based processing access.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Expose validated store/day metrics through the governed reporting catalog.
+  GoldDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Name:
+          Fn::Sub: freshroute_${Environment}_gold
+        Description: FreshRoute gold data
+        # Set defaults for this database only; do not replace unrelated account catalog settings.
+        CreateTableDefaultPermissions:
+          - Principal:
+              DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+            Permissions:
+              - ALL
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Reapply a possibly inherited IAM fallback; the opted-in analyst still needs LF grants.
+  GoldIamAccess:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+      Resource:
+        DatabaseResource:
+          CatalogId:
+            Ref: AWS::AccountId
+          Name:
+            Ref: GoldDatabase
+    # Preserve this shared grant when the Gold database is retained.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Keep frozen input manifests and temporary candidate tables outside reporting access.
+  ControlDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Name:
+          Fn::Sub: freshroute_${Environment}_control
+        Description: FreshRoute control data
+        # Set defaults for this database only; do not replace unrelated account catalog settings.
+        CreateTableDefaultPermissions:
+          - Principal:
+              DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+            Permissions:
+              - ALL
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # The control database can inherit this grant during creation. Grant it without requiring
+  # exclusive PrincipalPermissions ownership of an already-existing principal/database pair.
+  ControlIamAccess:
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: IAM_ALLOWED_PRINCIPALS
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+      Resource:
+        DatabaseResource:
+          CatalogId:
+            Ref: AWS::AccountId
+          Name:
+            Ref: ControlDatabase
+    # Preserve processing access if the control database outlives this stack.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # Native Glue Iceberg tables persist data under their own warehouse locations.
+  # One current record per store_id; supplies report labels and fulfillment capacity.
+  StoresTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: SilverDatabase
+      TableInput:
+        Name: stores
+        TableType: EXTERNAL_TABLE
+        # Keep these ordered columns aligned with src/freshroute/model.py and generated INSERT SQL.
+        StorageDescriptor:
+          Columns:
+            - Name: store_id
+              Type: string
+            - Name: store_name
+              Type: string
+            - Name: city
+              Type: string
+            - Name: locality
+              Type: string
+            - Name: latitude
+              Type: double
+            - Name: longitude
+              Type: double
+            - Name: capacity_per_hour
+              Type: int
+            - Name: source_version
+              Type: bigint
+            - Name: updated_at
+              Type: timestamp
+          Location:
+            Fn::Sub: s3://${DataBucket}/warehouse/silver/stores/
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+    DependsOn:
+      - SilverCreatorLocation
+      - SilverIamAccess
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # One current record per product_id; supplies catalog descriptions and reference prices.
+  ProductsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: SilverDatabase
+      TableInput:
+        Name: products
+        TableType: EXTERNAL_TABLE
+        # Keep these ordered columns aligned with src/freshroute/model.py and generated INSERT SQL.
+        StorageDescriptor:
+          Columns:
+            - Name: product_id
+              Type: string
+            - Name: product_name
+              Type: string
+            - Name: category
+              Type: string
+            - Name: pack_size
+              Type: string
+            - Name: unit_price_paise
+              Type: bigint
+            - Name: source_version
+              Type: bigint
+            - Name: updated_at
+              Type: timestamp
+          Location:
+            Fn::Sub: s3://${DataBucket}/warehouse/silver/products/
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+    DependsOn:
+      - SilverCreatorLocation
+      - SilverIamAccess
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # One current record per order_id; owns delivery promises and reconciled basket totals.
+  OrdersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: SilverDatabase
+      TableInput:
+        Name: orders
+        TableType: EXTERNAL_TABLE
+        # Keep these ordered columns aligned with src/freshroute/model.py and generated INSERT SQL.
+        StorageDescriptor:
+          Columns:
+            - Name: order_id
+              Type: string
+            - Name: store_id
+              Type: string
+            - Name: customer_key
+              Type: string
+            - Name: created_at
+              Type: timestamp
+            - Name: promised_at
+              Type: timestamp
+            - Name: distance_km
+              Type: double
+            - Name: item_count
+              Type: int
+            - Name: subtotal_paise
+              Type: bigint
+            - Name: delivery_fee_paise
+              Type: bigint
+            - Name: discount_paise
+              Type: bigint
+            - Name: total_paise
+              Type: bigint
+            - Name: source_version
+              Type: bigint
+            - Name: updated_at
+              Type: timestamp
+          Location:
+            Fn::Sub: s3://${DataBucket}/warehouse/silver/orders/
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+    DependsOn:
+      - SilverCreatorLocation
+      - SilverIamAccess
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # One current record per order_item_id; connects orders to purchased products and quantities.
+  OrderItemsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: SilverDatabase
+      TableInput:
+        Name: order_items
+        TableType: EXTERNAL_TABLE
+        # Keep these ordered columns aligned with src/freshroute/model.py and generated INSERT SQL.
+        StorageDescriptor:
+          Columns:
+            - Name: order_item_id
+              Type: string
+            - Name: order_id
+              Type: string
+            - Name: product_id
+              Type: string
+            - Name: quantity
+              Type: int
+            - Name: unit_price_paise
+              Type: bigint
+            - Name: line_total_paise
+              Type: bigint
+            - Name: source_version
+              Type: bigint
+            - Name: updated_at
+              Type: timestamp
+          Location:
+            Fn::Sub: s3://${DataBucket}/warehouse/silver/order_items/
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+    DependsOn:
+      - SilverCreatorLocation
+      - SilverIamAccess
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # One current record per event_id; lifecycle stages use business time, not arrival time.
+  EventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: SilverDatabase
+      TableInput:
+        Name: events
+        TableType: EXTERNAL_TABLE
+        # Keep these ordered columns aligned with src/freshroute/model.py and generated INSERT SQL.
+        StorageDescriptor:
+          Columns:
+            - Name: event_id
+              Type: string
+            - Name: order_id
+              Type: string
+            - Name: event_type
+              Type: string
+            - Name: event_time
+              Type: timestamp
+            - Name: source_version
+              Type: bigint
+            - Name: updated_at
+              Type: timestamp
+          Location:
+            Fn::Sub: s3://${DataBucket}/warehouse/silver/events/
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+    DependsOn:
+      - SilverCreatorLocation
+      - SilverIamAccess
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # One published record per business_date/store_id; updated by a single atomic MERGE.
+  StoreDailyTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: GoldDatabase
+      TableInput:
+        Name: store_daily
+        TableType: EXTERNAL_TABLE
+        # Keep these ordered columns aligned with src/freshroute/model.py and generated INSERT SQL.
+        StorageDescriptor:
+          Columns:
+            - Name: business_date
+              Type: date
+            - Name: store_id
+              Type: string
+            - Name: store_name
+              Type: string
+            - Name: city
+              Type: string
+            - Name: order_count
+              Type: bigint
+            - Name: delivered_count
+              Type: bigint
+            - Name: cancelled_count
+              Type: bigint
+            - Name: pending_count
+              Type: bigint
+            - Name: on_time_count
+              Type: bigint
+            - Name: late_count
+              Type: bigint
+            - Name: on_time_pct
+              Type: double
+            - Name: avg_picking_minutes
+              Type: double
+            - Name: avg_dispatch_minutes
+              Type: double
+            - Name: avg_travel_minutes
+              Type: double
+            - Name: delivered_revenue_paise
+              Type: bigint
+            - Name: metric_version
+              Type: string
+            - Name: published_at
+              Type: timestamp
+          Location:
+            Fn::Sub: s3://${DataBucket}/warehouse/gold/store_daily/
+      OpenTableFormatInput:
+        IcebergInput:
+          MetadataOperation: CREATE
+          Version: '2'
+    DependsOn:
+      - GoldCreatorLocation
+      - GoldIamAccess
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  # One transport envelope represents every source entity; payload holds the original business
+  # fields.
+  # Read the same envelope from plain historical JSON Lines and buffered Firehose objects.
+  RawRecords:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: RawDatabase
+      TableInput:
+        Name: records
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+        StorageDescriptor:
+          Columns:
+            - Name: entity_type
+              Type: string
+            - Name: record_id
+              Type: string
+            - Name: ingested_at
+              Type: string
+            - Name: payload
+              Type: string
+          Location:
+            Fn::Sub: s3://${DataBucket}/bronze/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'false'
+  # Frozen run manifests constrain exactly which immutable source files each run processes.
+  # Freeze exact S3 paths per run_token so queries share the same input snapshot.
+  InputManifest:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: ControlDatabase
+      TableInput:
+        Name: input_manifest
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+        StorageDescriptor:
+          Columns:
+            - Name: run_token
+              Type: string
+            - Name: source_path
+              Type: string
+          Location:
+            Fn::Sub: s3://${DataBucket}/control/manifests/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'false'
+  # Allow discovery of the Gold database without granting access to other layers.
+  AnalystDatabase:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier:
+          Fn::GetAtt:
+            - AnalystRole
+            - Arn
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+      Resource:
+        Database:
+          CatalogId:
+            Ref: AWS::AccountId
+          Name:
+            Ref: GoldDatabase
+    DependsOn: StoreDailyTable
+  # Grant read-only table access; the separate hybrid opt-in activates enforcement.
+  AnalystTables:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier:
+          Fn::GetAtt:
+            - AnalystRole
+            - Arn
+      Permissions:
+        - SELECT
+      PermissionsWithGrantOption: []
+      Resource:
+        Table:
+          CatalogId:
+            Ref: AWS::AccountId
+          DatabaseName:
+            Ref: GoldDatabase
+          TableWildcard: {}
+    DependsOn: StoreDailyTable
+  # Retain the custom resource operation/error logs without logging its response URL.
+  GovernanceLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/freshroute-${Environment}-governance
+      RetentionInDays: 30
+  # CloudFormation manages the hybrid opt-in lifecycle after the analyst grants exist.
+  GovernanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: freshroute-${Environment}-governance
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Role:
+        Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/freshroute-${Environment}-governance
+      Code:
+        ZipFile: |
+          """CloudFormation lifecycle handler for Lake Formation hybrid opt-ins."""
+
+          import json
+          import logging
+          import urllib.request
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+
+          def handler(event, context):
+              """Opt the analyst into governed access; keep the writer on its scoped IAM path."""
+              # CloudFormation sends Create/Update/Delete requests. Every path must
+              # produce a response, including a Lake Formation service failure.
+              status, reason = "SUCCESS", "Hybrid access configured"
+              properties = event["ResourceProperties"]
+              principal = {"DataLakePrincipalIdentifier": properties["PrincipalArn"]}
+              database = properties["Database"]
+              # Hybrid enforcement is opted in at both database and table scope.
+              # Grants alone do not activate governance for this analyst principal.
+              resources = [
+                  {"Database": {"CatalogId": properties["Account"], "Name": database}},
+                  {
+                      "Table": {
+                          "CatalogId": properties["Account"],
+                          "DatabaseName": database,
+                          "TableWildcard": {},
+                      }
+                  },
+              ]
+              api = boto3.client("lakeformation")
+              try:
+                  for resource in resources:
+                      # Opt-in is separate from grants. Both are required for hybrid enforcement.
+                      try:
+                          # Deletion removes opt-ins before their dependent grants
+                          # disappear; Create and Update converge on the same state.
+                          operation = (
+                              api.delete_lake_formation_opt_in
+                              if event["RequestType"] == "Delete"
+                              else api.create_lake_formation_opt_in
+                          )
+                          operation(Principal=principal, Resource=resource)
+                      except ClientError as error:
+                          code = error.response["Error"]["Code"]
+                          message = error.response["Error"].get("Message", "").strip().rstrip(".").casefold()
+                          expected = (
+                              "EntityNotFoundException"
+                              if event["RequestType"] == "Delete"
+                              else "AlreadyExistsException"
+                          )
+                          # Lake Formation also reports an absent opt-in as InvalidInputException.
+                          # Accept only this exact absence message during deletion; a malformed
+                          # request or the same error during creation must still fail the stack.
+                          missing_opt_in = (
+                              event["RequestType"] == "Delete"
+                              and code == "InvalidInputException"
+                              and message == "lakeformation optin does not exist"
+                          )
+                          # CloudFormation may retry an operation that already took
+                          # effect. Only the matching idempotent outcome is ignored.
+                          if code != expected and not missing_opt_in:
+                              raise
+                  LOGGER.info(
+                      json.dumps(
+                          {
+                              "event": "governance.opt_in",
+                              "operation": event["RequestType"],
+                              "database": database,
+                          }
+                      )
+                  )
+              except Exception as error:
+                  LOGGER.exception("Lake Formation configuration failed")
+                  status, reason = "FAILED", str(error)[:700]
+              # A response is mandatory on failure too, otherwise CloudFormation waits until
+              # timeout.
+              # Never log the presigned ResponseURL because it is a temporary credential.
+              response = {
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": event.get("PhysicalResourceId", f"freshroute-{database}-analyst"),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }
+              # Preserve the physical ID across retries and send UTF-8 bytes with
+              # the exact byte length required by the presigned response endpoint.
+              body = json.dumps(response).encode()
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+              )
+              with urllib.request.urlopen(request, timeout=30) as result:
+                  result.read()
+    DependsOn: GovernanceLog
+  # Invoke the lifecycle handler only after database and table grants have been created.
+  AnalystOptIn:
+    Type: Custom::LakeFormationHybridOptIn
+    Properties:
+      ServiceToken:
+        Fn::GetAtt:
+          - GovernanceFunction
+          - Arn
+      PrincipalArn:
+        Fn::GetAtt:
+          - AnalystRole
+          - Arn
+      Database:
+        Ref: GoldDatabase
+      Account:
+        Ref: AWS::AccountId
+    DependsOn:
+      - AnalystDatabase
+      - AnalystTables
+  # Separate enforced query outputs prevent analysts from reading private candidate results.
+  PipelineWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name:
+        Fn::Sub: freshroute-${Environment}-pipeline
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        # Queries must use this encrypted result location even if a caller requests another one.
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        # Bound a single query to 10 GiB of scanned data for this workload.
+        BytesScannedCutoffPerQuery: 10737418240
+        # Engine 3 supplies the Iceberg MERGE and SQL functions used by the pipeline.
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        ResultConfiguration:
+          OutputLocation:
+            Fn::Sub: s3://${DataBucket}/query-results/pipeline/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+  # Separate analyst query results from private pipeline candidates and control queries.
+  AnalystWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name:
+        Fn::Sub: freshroute-${Environment}-analyst
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        # Queries must use this encrypted result location even if a caller requests another one.
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        # Bound a single query to 10 GiB of scanned data for this workload.
+        BytesScannedCutoffPerQuery: 10737418240
+        # Engine 3 supplies the Iceberg MERGE and SQL functions used by the pipeline.
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        ResultConfiguration:
+          OutputLocation:
+            Fn::Sub: s3://${DataBucket}/query-results/analyst/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+  # Keep ingestion delivery diagnostics separate from Airflow task logs.
+  FirehoseLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/kinesisfirehose/freshroute-${Environment}-events
+      RetentionInDays: 30
+  # Use a stable stream for Firehose delivery errors within the environment log group.
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName:
+        Ref: FirehoseLog
+      LogStreamName: delivery
+  # Allow the delivery service to write Bronze and ingestion errors, not the warehouse.
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: freshroute-${Environment}-firehose
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  Fn::GetAtt:
+                    - DataBucket
+                    - Arn
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - Fn::Sub: ${DataBucket.Arn}/bronze/*
+                  - Fn::Sub: ${DataBucket.Arn}/ingestion-errors/*
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - FirehoseLog
+                    - Arn
+  # Buffer event envelopes into compressed Bronze files for the same processing path as historical
+  # data.
+  EventDelivery:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName:
+        Fn::Sub: freshroute-${Environment}-events
+      DeliveryStreamType: DirectPut
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN:
+          Fn::GetAtt:
+            - DataBucket
+            - Arn
+        RoleARN:
+          Fn::GetAtt:
+            - FirehoseRole
+            - Arn
+        Prefix: bronze/stream/arrival_date=!{timestamp:yyyy-MM-dd}/
+        # Keep failed ingestion output outside Bronze so normal queries do not treat it as source
+        # data.
+        ErrorOutputPrefix: ingestion-errors/!{firehose:error-output-type}/
+        # This is service-side storage compression; repository input files remain plain JSON Lines.
+        CompressionFormat: GZIP
+        # Buffer small events into S3 objects; application scheduling begins after files become
+        # visible.
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName:
+            Ref: FirehoseLog
+          LogStreamName:
+            Ref: FirehoseLogStream
+Outputs:
+  # Retain source and warehouse data on stack deletion; block public access and enable versioning.
+  DataBucket:
+    Value:
+      Ref: DataBucket
+    Export:
+      Name:
+        Fn::Sub: freshroute-${Environment}-DataBucket
+  ArtifactsBucket:
+    Value:
+      Ref: ArtifactsBucket
+    Export:
+      Name:
+        Fn::Sub: freshroute-${Environment}-ArtifactsBucket
+  PipelineRoleArn:
+    Value:
+      Fn::GetAtt:
+        - PipelineRole
+        - Arn
+    Export:
+      Name:
+        Fn::Sub: freshroute-${Environment}-PipelineRoleArn
+  AnalystRoleArn:
+    Value:
+      Fn::GetAtt:
+        - AnalystRole
+        - Arn
+    Export:
+      Name:
+        Fn::Sub: freshroute-${Environment}-AnalystRoleArn
+  FirehoseName:
+    Value:
+      Ref: EventDelivery
+    Export:
+      Name:
+        Fn::Sub: freshroute-${Environment}-FirehoseName

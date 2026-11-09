@@ -1,0 +1,45 @@
+{
+  "provenance": "Generated operational data; no BigBasket proprietary data",
+  "seed": 20261024,
+  "start": "2026-10-01",
+  "days": 7,
+  "orders_per_day": 1000,
+  "batches": [
+    {
+      "file": "base/stores.jsonl",
+      "sha256": "f5db6b3553853f0a8a625d10c4d242cf49c7d88fbb171089d66c866fb08c017a",
+      "records": 6,
+      "scenario": "base"
+    },
+    {
+      "file": "base/products.jsonl",
+      "sha256": "3a557f6208fe0b2b8fe98bdb30b0afc5bdeed462f2e07a0199cd302dbdfcd117",
+      "records": 24,
+      "scenario": "base"
+    },
+    {
+      "file": "base/orders.jsonl",
+      "sha256": "45a50f6e65da8947c97721ba204947e9db23a00045a92a581561658c0d0b6d25",
+      "records": 7042,
+      "scenario": "base"
+    },
+    {
+      "file": "base/order_items.jsonl",
+      "sha256": "978c4bc1e28272c9dab34cf858f5a74f998ab788f09dabb3b037fb7b9e81a127",
+      "records": 30233,
+      "scenario": "base"
+    },
+    {
+      "file": "base/events.jsonl",
+      "sha256": "ffadb018afe35697a114fb7918509acc118b05b067aa018aae0da2288d127f21",
+      "records": 34912,
+      "scenario": "base"
+    },
+    {
+      "file": "late/events.jsonl",
+      "sha256": "788816989b978d4b7d49aa85831c15637a9f37bbe46cd15259250b70a3492d36",
+      "records": 246,
+      "scenario": "late"
+    }
+  ]
+}

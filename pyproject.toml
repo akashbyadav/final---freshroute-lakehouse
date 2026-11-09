@@ -1,0 +1,19 @@
+[tool.pytest.ini_options]
+# Keep repeated local/CI validation from leaving cache files in the repository.
+addopts = "-p no:cacheprovider"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+# One formatter controls indentation and wrapping across application code and tests.
+line-length = 100
+indent-width = 4
+target-version = "py312"
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["E4", "E501", "E7", "E9", "F", "B"]
+

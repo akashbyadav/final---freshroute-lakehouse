@@ -1,0 +1,709 @@
+# Create once from the CloudFormation console in us-east-1. Edit this source directly.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FreshRoute GitHub connection, branch webhooks, CodeBuild, and provisioning roles (us-east-1)
+Parameters:
+  GitHubRepository:
+    Type: String
+    Description: Repository owner/name, copied from GitHub.
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+  GitHubConnectionArn:
+    Type: String
+    Description: Available GitHub connection created in us-east-1.
+    AllowedPattern: arn:aws:(codeconnections|codestar-connections):us-east-1:[0-9]{12}:connection/[a-zA-Z0-9-]+
+Resources:
+  # CloudFormation provisions dev resources using this environment-specific role.
+  DevExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: freshroute-dev-cfn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-dev-*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-dev-*/*
+              - Effect: Allow
+                # Create and maintain environment-prefixed roles used by the managed services.
+                Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/freshroute-dev-*
+              - Effect: Allow
+                # Manage VPC lifecycle and Lake Formation control-plane settings with account-wide
+                # scope.
+                Action:
+                  - ec2:*
+                  - lakeformation:*
+                Resource: '*'
+              - Effect: Allow
+                # Read or maintain catalog metadata only within the listed environment
+                # databases/tables.
+                Action:
+                  - glue:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/freshroute_dev_*
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/freshroute_dev_*/*
+              - Effect: Allow
+                # Run and inspect queries through the named workgroup and its enforced results
+                # location.
+                Action:
+                  - athena:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/freshroute-dev-*
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/freshroute-dev-*
+              - Effect: Allow
+                # Discover MWAA environments and log groups; these list APIs use wildcard scope.
+                Action:
+                  - airflow:ListEnvironments
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                # Use only the environment event-delivery stream identified by the resource ARN.
+                Action:
+                  - firehose:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/freshroute-dev-*
+              - Effect: Allow
+                # Manage the environment governance function used by the hybrid opt-in custom
+                # resource.
+                Action:
+                  - lambda:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:freshroute-dev-*
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/freshroute-dev-*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-freshroute-dev-*
+                  - Fn::Sub:
+                      arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/freshroute-dev-*
+              - Effect: Allow
+                # Maintain environment alarms and their tags for pipeline/ingestion monitoring.
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:freshroute-dev-*
+              - Effect: Allow
+                # Permit service-linked role creation only for the listed AWS services.
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - airflow.amazonaws.com
+                      - lakeformation.amazonaws.com
+                      - firehose.amazonaws.com
+  # The governance function opts the dev analyst into Lake Formation hybrid enforcement.
+  DevGovernanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: freshroute-dev-governance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Allow the listed Lake Formation operations; table access is governed by separate
+                # grants.
+                Action:
+                  - lakeformation:CreateLakeFormationOptIn
+                  - lakeformation:DeleteLakeFormationOptIn
+                  - lakeformation:ListLakeFormationOptIns
+                Resource: '*'
+              - Effect: Allow
+                # Opt-in validates the target database/tables through Glue. Lake Formation
+                # administrator status does not supply these IAM metadata-read permissions.
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                # Glue authorizes catalog ancestors as well as the target database/table.
+                # Limit metadata access to dev Gold, which is the analyst opt-in scope.
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/freshroute_dev_gold
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/freshroute_dev_gold/*
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub:
+                    arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/freshroute-dev-governance:*
+  # Keep build diagnostics for fourteen days without creating an extra artifact bucket.
+  DevBuildLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/freshroute-dev-build
+      RetentionInDays: 14
+  # CodeBuild obtains temporary credentials; the trust policy binds them to this project.
+  DevBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: freshroute-dev-build
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            # Bind the CodeBuild service trust to this account and this specific project.
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnEquals:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/freshroute-dev-build
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Create, update, and inspect only stacks within the environment name prefix.
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStackResources
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/freshroute-dev-*/*
+              - Effect: Allow
+                # Template validation does not have a stack resource ARN and uses wildcard scope.
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                # Pass only the environment provisioning role to CloudFormation.
+                Action:
+                  - iam:PassRole
+                Resource:
+                  Fn::GetAtt:
+                    - DevExecutionRole
+                    - Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Effect: Allow
+                # Deployment writes DAG artifacts only. The data bucket is deliberately
+                # outside this grant; operators upload source files separately in S3.
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-dev-artifacts-${AWS::AccountId}-${AWS::Region}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-dev-artifacts-${AWS::AccountId}-${AWS::Region}/*
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:InvokeRestApi
+                  - airflow:CreateWebLoginToken
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:role/freshroute-dev-airflow/Admin
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:GetEnvironment
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/freshroute-dev-airflow
+              - Effect: Allow
+                # Use the explicitly supplied GitHub connection for authenticated source access.
+                Action:
+                  - codeconnections:GetConnectionToken
+                  - codeconnections:GetConnection
+                Resource:
+                  Ref: GitHubConnectionArn
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - DevBuildLogs
+                    - Arn
+  # A PUSH and the exact dev ref must both match; pull requests do not deploy.
+  DevBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - LakeFormationAdministrators
+    Properties:
+      Name: freshroute-dev-build
+      Description: GitHub dev pushes validate and deploy FreshRoute dev
+      ServiceRole:
+        Fn::GetAtt:
+          - DevBuildRole
+          - Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      # Read the triggering commit from the authorized GitHub repository.
+      Source:
+        Type: GITHUB
+        Location:
+          Fn::Sub: https://github.com/${GitHubRepository}.git
+        # Use the console-authorized connection; no access token is stored in source control.
+        Auth:
+          Type: CODECONNECTIONS
+          Resource:
+            Ref: GitHubConnectionArn
+        BuildSpec: buildspec.yml
+        GitCloneDepth: 1
+        ReportBuildStatus: true
+      SourceVersion: dev
+      # Both filters must match in this single group; unrelated branches and PR events do not
+      # deploy.
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          -
+            - Type: EVENT
+              Pattern: PUSH
+            - Type: HEAD_REF
+              Pattern: ^refs/heads/dev$
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: false
+        # The branch fixes the deployment environment; data operations use S3 and Airflow.
+        EnvironmentVariables:
+          - Name: TARGET_ENV
+            Type: PLAINTEXT
+            Value: dev
+      # Prevent two builds from changing the same stacks or DAG files simultaneously.
+      ConcurrentBuildLimit: 1
+      # Allow time for first-time MWAA provisioning and DAG synchronization.
+      TimeoutInMinutes: 240
+      QueuedTimeoutInMinutes: 480
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName:
+            Ref: DevBuildLogs
+      Tags:
+        - Key: Project
+          Value: freshroute
+        - Key: Environment
+          Value: dev
+  # Production uses separate provisioning permissions within the same account.
+  ProdExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: freshroute-prod-cfn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Scope bucket/object operations to the listed prefixes; input and result
+                # permissions differ.
+                Action:
+                  - s3:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-prod-*
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-prod-*/*
+              - Effect: Allow
+                # Create and maintain environment-prefixed roles used by the managed services.
+                Action:
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/freshroute-prod-*
+              - Effect: Allow
+                # Manage VPC lifecycle and Lake Formation control-plane settings with account-wide
+                # scope.
+                Action:
+                  - ec2:*
+                  - lakeformation:*
+                Resource: '*'
+              - Effect: Allow
+                # Read or maintain catalog metadata only within the listed environment
+                # databases/tables.
+                Action:
+                  - glue:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/freshroute_prod_*
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/freshroute_prod_*/*
+              - Effect: Allow
+                # Run and inspect queries through the named workgroup and its enforced results
+                # location.
+                Action:
+                  - athena:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/freshroute-prod-*
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/freshroute-prod-*
+              - Effect: Allow
+                # Discover MWAA environments and log groups; these list APIs use wildcard scope.
+                Action:
+                  - airflow:ListEnvironments
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                # Use only the environment event-delivery stream identified by the resource ARN.
+                Action:
+                  - firehose:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/freshroute-prod-*
+              - Effect: Allow
+                # Manage the environment governance function used by the hybrid opt-in custom
+                # resource.
+                Action:
+                  - lambda:*
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:freshroute-prod-*
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/freshroute-prod-*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:airflow-freshroute-prod-*
+                  - Fn::Sub:
+                      arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/freshroute-prod-*
+              - Effect: Allow
+                # Maintain environment alarms and their tags for pipeline/ingestion monitoring.
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:freshroute-prod-*
+              - Effect: Allow
+                # Permit service-linked role creation only for the listed AWS services.
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - airflow.amazonaws.com
+                      - lakeformation.amazonaws.com
+                      - firehose.amazonaws.com
+  # Production has its own Lake Formation opt-in function identity.
+  ProdGovernanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: freshroute-prod-governance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Allow the listed Lake Formation operations; table access is governed by separate
+                # grants.
+                Action:
+                  - lakeformation:CreateLakeFormationOptIn
+                  - lakeformation:DeleteLakeFormationOptIn
+                  - lakeformation:ListLakeFormationOptIns
+                Resource: '*'
+              - Effect: Allow
+                # The production opt-in needs the same Glue metadata reads as development.
+                # Keep its database/table scope independent from the dev environment.
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/freshroute_prod_gold
+                  - Fn::Sub: arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/freshroute_prod_gold/*
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::Sub:
+                    arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/freshroute-prod-governance:*
+  # Production build logs remain separate from development logs.
+  ProdBuildLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/freshroute-prod-build
+      RetentionInDays: 14
+  # Only the production CodeBuild project can obtain these deployment credentials.
+  ProdBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: freshroute-prod-build
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            # Bind the CodeBuild service trust to this account and this specific project.
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+              ArnEquals:
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/freshroute-prod-build
+      Policies:
+        - PolicyName: ResourceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                # Create, update, and inspect only stacks within the environment name prefix.
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStackResources
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/freshroute-prod-*/*
+              - Effect: Allow
+                # Template validation does not have a stack resource ARN and uses wildcard scope.
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                # Pass only the environment provisioning role to CloudFormation.
+                Action:
+                  - iam:PassRole
+                Resource:
+                  Fn::GetAtt:
+                    - ProdExecutionRole
+                    - Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Effect: Allow
+                # Deployment writes DAG artifacts only. The data bucket is deliberately
+                # outside this grant; operators upload source files separately in S3.
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-prod-artifacts-${AWS::AccountId}-${AWS::Region}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::freshroute-prod-artifacts-${AWS::AccountId}-${AWS::Region}/*
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:InvokeRestApi
+                  - airflow:CreateWebLoginToken
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:role/freshroute-prod-airflow/Admin
+              - Effect: Allow
+                # Manage or invoke the MWAA resources identified below; these actions do not read
+                # table data.
+                Action:
+                  - airflow:GetEnvironment
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/freshroute-prod-airflow
+              - Effect: Allow
+                # Use the explicitly supplied GitHub connection for authenticated source access.
+                Action:
+                  - codeconnections:GetConnectionToken
+                  - codeconnections:GetConnection
+                Resource:
+                  Ref: GitHubConnectionArn
+              - Effect: Allow
+                # Allow the service to create/read/write only the listed operational log resources.
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - ProdBuildLogs
+                    - Arn
+  # Merging into main produces a PUSH that deploys production.
+  ProdBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+      - LakeFormationAdministrators
+    Properties:
+      Name: freshroute-prod-build
+      Description: GitHub main pushes validate and deploy FreshRoute prod
+      ServiceRole:
+        Fn::GetAtt:
+          - ProdBuildRole
+          - Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      # Read the triggering commit from the authorized GitHub repository.
+      Source:
+        Type: GITHUB
+        Location:
+          Fn::Sub: https://github.com/${GitHubRepository}.git
+        # Use the console-authorized connection; no access token is stored in source control.
+        Auth:
+          Type: CODECONNECTIONS
+          Resource:
+            Ref: GitHubConnectionArn
+        BuildSpec: buildspec.yml
+        GitCloneDepth: 1
+        ReportBuildStatus: true
+      SourceVersion: main
+      # Both filters must match in this single group; unrelated branches and PR events do not
+      # deploy.
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          -
+            - Type: EVENT
+              Pattern: PUSH
+            - Type: HEAD_REF
+              Pattern: ^refs/heads/main$
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: false
+        # The branch fixes the deployment environment; data operations use S3 and Airflow.
+        EnvironmentVariables:
+          - Name: TARGET_ENV
+            Type: PLAINTEXT
+            Value: prod
+      # Prevent two builds from changing the same stacks or DAG files simultaneously.
+      ConcurrentBuildLimit: 1
+      # Allow time for first-time MWAA provisioning and DAG synchronization.
+      TimeoutInMinutes: 240
+      QueuedTimeoutInMinutes: 480
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName:
+            Ref: ProdBuildLogs
+      Tags:
+        - Key: Project
+          Value: freshroute
+        - Key: Environment
+          Value: prod
+  # Append project administrators while preserving existing account administrators.
+  LakeFormationAdministrators:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      # Append project roles while preserving administrators already configured in the account.
+      MutationType: APPEND
+      Admins:
+        - DataLakePrincipalIdentifier:
+            Fn::GetAtt:
+              - DevExecutionRole
+              - Arn
+        - DataLakePrincipalIdentifier:
+            Fn::GetAtt:
+              - DevGovernanceRole
+              - Arn
+        - DataLakePrincipalIdentifier:
+            Fn::GetAtt:
+              - ProdExecutionRole
+              - Arn
+        - DataLakePrincipalIdentifier:
+            Fn::GetAtt:
+              - ProdGovernanceRole
+              - Arn
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+Outputs:
+  DevBuildProject:
+    Description: Starts on pushes to dev.
+    Value:
+      Ref: DevBuildProject
+  ProdBuildProject:
+    Description: Starts on pushes to main.
+    Value:
+      Ref: ProdBuildProject
